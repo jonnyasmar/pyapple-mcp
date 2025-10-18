@@ -374,14 +374,15 @@ def mail(
     full_content: bool = False,
     search_range: int = None,
     mark_read: bool = False,
+    message_ids: List[int] = None,
 ) -> str:
     """
-    Interact with Apple Mail app - read unread emails, search emails, and send emails.
+    Interact with Apple Mail app - read unread emails, search emails, send emails, and delete emails.
     Optimized for performance by accessing local Mail database directly.
     Searches all accounts by default when no account is specified.
 
     Args:
-        operation: Operation to perform: 'unread', 'search', 'send', 'mailboxes', or 'accounts'
+        operation: Operation to perform: 'unread', 'search', 'send', 'delete', 'mailboxes', or 'accounts'
         account: Email account to use (optional, searches all accounts if not specified)
         mailbox: Mailbox to use (optional)
         limit: Number of emails to retrieve (optional, for unread and search operations)
@@ -394,6 +395,7 @@ def mail(
         full_content: If True, return full email content without truncation (default: False)
         search_range: Number of recent messages to search through per inbox (optional, ignored for database method)
         mark_read: If True, mark retrieved unread emails as read (default: False, only for unread operation)
+        message_ids: List of email message IDs to delete (required for delete operation)
 
     Returns:
         String containing email information or operation result
@@ -407,7 +409,7 @@ def mail(
             if emails:
                 formatted_emails = []
                 for email in emails:
-                    email_info = f"From: {email['sender']}\nSubject: {email['subject']}\nDate: {email['date']}"
+                    email_info = f"ID: {email['id']}\nFrom: {email['sender']}\nSubject: {email['subject']}\nDate: {email['date']}"
                     if email.get('mailbox'):
                         email_info += f"\nMailbox: {email['mailbox']}"
                     if full_content or len(email['content']) <= 500:
@@ -432,7 +434,7 @@ def mail(
             if emails:
                 formatted_emails = []
                 for email in emails:
-                    email_info = f"From: {email['sender']}\nSubject: {email['subject']}\nDate: {email['date']}"
+                    email_info = f"ID: {email['id']}\nFrom: {email['sender']}\nSubject: {email['subject']}\nDate: {email['date']}"
                     if email.get('account'):
                         email_info += f"\nAccount: {email['account']}"
                     if email.get('mailbox'):
@@ -476,10 +478,20 @@ def mail(
                 return f"Available accounts: {', '.join(accounts)}"
             else:
                 return "No email accounts found"
-                
+
+        elif operation == "delete":
+            if not message_ids:
+                return "Message IDs are required for delete operation"
+
+            result = mail_handler.delete_emails(message_ids)
+            if result["success"]:
+                return result["message"]
+            else:
+                return f"Failed to delete emails: {result['message']}"
+
         else:
-            return f"Unknown operation: {operation}. Valid operations are: unread, search, send, mailboxes, accounts"
-            
+            return f"Unknown operation: {operation}. Valid operations are: unread, search, send, delete, mailboxes, accounts"
+
     except Exception as e:
         logger.error(f"Error in mail tool: {e}")
         return f"Error accessing mail: {str(e)}"

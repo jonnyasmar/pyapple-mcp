@@ -612,17 +612,195 @@ class MailHandler:
             logger.error(f"Failed to list mailboxes: {result.get('result', result.get('error'))}")
             return []
     
+    def _get_mailbox_for_message(self, message_id: int) -> Optional[str]:
+        """
+        Get the mailbox name for a specific message ID from the database.
+
+        Args:
+            message_id: The message ROWID from the database
+
+        Returns:
+            Mailbox name or None if not found
+        """
+        try:
+            conn = sqlite3.connect(str(self.envelope_db))
+            cursor = conn.cursor()
+
+            query = """
+            SELECT COALESCE(mb.url, '') as mailbox
+            FROM messages m
+            LEFT JOIN mailboxes mb ON m.mailbox = mb.ROWID
+            WHERE m.ROWID = ? AND m.deleted = 0
+            LIMIT 1
+            """
+
+            cursor.execute(query, (message_id,))
+            row = cursor.fetchone()
+            conn.close()
+
+            if row and row[0]:
+                mailbox_url = row[0]
+                # Extract meaningful mailbox name from URL
+                mailbox_name = mailbox_url.split('/')[-1].replace('.mbox', '') if '/' in mailbox_url else mailbox_url
+                # URL decode the mailbox name
+                mailbox_name = mailbox_name.replace('%20', ' ')
+                return mailbox_name
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Error getting mailbox for message {message_id}: {e}")
+            return None
+
+    def delete_emails(self, message_ids: List[int]) -> Dict[str, Any]:
+        """
+        Delete emails using AppleScript's efficient 'whose' clause.
+        This approach is much faster than iterating through messages manually.
+
+        Args:
+            message_ids: List of message IDs to delete
+
+        Returns:
+            Dictionary with success status and message
+        """
+        if not applescript.check_app_access(self.app_name):
+            logger.error("Cannot access Mail app")
+            return {"success": False, "message": "Cannot access Mail app"}
+
+        if not message_ids:
+            return {"success": True, "message": "No emails to delete"}
+
+        # Convert message IDs to AppleScript list format
+        ids_string = ",".join(str(id) for id in message_ids)
+
+        script = f'''
+        tell application "Mail"
+            try
+                set targetIds to {{{ids_string}}}
+                set deletedCount to 0
+                set notFoundIds to {{}}
+
+                -- For each target ID, find and delete the message using 'whose' clause
+                repeat with targetId in targetIds
+                    set foundMessage to false
+
+                    -- Search all mailboxes in all accounts
+                    repeat with anAccount in accounts
+                        repeat with aMailbox in mailboxes of anAccount
+                            try
+                                -- Use 'whose' clause for efficient filtering
+                                set matchingMessages to (every message of aMailbox whose id = targetId)
+
+                                if (count of matchingMessages) > 0 then
+                                    -- Delete all matching messages (should be just one)
+                                    repeat with aMessage in matchingMessages
+                                        delete aMessage
+                                        set deletedCount to deletedCount + 1
+                                        set foundMessage to true
+                                    end repeat
+
+                                    -- Exit account/mailbox loops once found
+                                    if foundMessage then
+                                        exit repeat
+                                    end if
+                                end if
+                            on error errMsg
+                                -- Skip mailboxes that can't be accessed
+                            end try
+                        end repeat
+
+                        -- Exit account loop if already found
+                        if foundMessage then
+                            exit repeat
+                        end if
+                    end repeat
+
+                    -- Track IDs that weren't found
+                    if not foundMessage then
+                        set end of notFoundIds to targetId
+                    end if
+                end repeat
+
+                -- Return results
+                if (count of notFoundIds) > 0 then
+                    set notFoundStr to ""
+                    repeat with notFoundId in notFoundIds
+                        if notFoundStr is "" then
+                            set notFoundStr to notFoundId as string
+                        else
+                            set notFoundStr to notFoundStr & "," & (notFoundId as string)
+                        end if
+                    end repeat
+                    return "DELETED:" & deletedCount & "|NOTFOUND:" & notFoundStr
+                else
+                    return "DELETED:" & deletedCount
+                end if
+
+            on error errMsg
+                return "ERROR:" & errMsg
+            end try
+        end tell
+        '''
+
+        result = applescript.run_script(script, timeout=60)
+
+        if not result['success']:
+            return {"success": False, "message": f"AppleScript error: {result.get('error', 'unknown error')}"}
+
+        result_str = result['result']
+
+        # Parse the result
+        if result_str.startswith("ERROR:"):
+            error_msg = result_str.replace("ERROR:", "")
+            return {"success": False, "message": f"Failed to delete emails: {error_msg}"}
+
+        # Parse deleted count and not found IDs
+        deleted_count = 0
+        not_found_ids = []
+
+        try:
+            parts = result_str.split("|")
+            for part in parts:
+                if part.startswith("DELETED:"):
+                    deleted_count = int(part.replace("DELETED:", ""))
+                elif part.startswith("NOTFOUND:"):
+                    not_found_str = part.replace("NOTFOUND:", "")
+                    if not_found_str:
+                        not_found_ids = [int(id_str) for id_str in not_found_str.split(",")]
+        except Exception as e:
+            logger.error(f"Error parsing delete result: {e}, result was: {result_str}")
+            return {"success": False, "message": f"Unexpected result format: {result_str}"}
+
+        # Build response message
+        total = len(message_ids)
+
+        if deleted_count == total:
+            return {
+                "success": True,
+                "message": f"Successfully deleted all {deleted_count} email(s)"
+            }
+        elif deleted_count > 0:
+            return {
+                "success": True,
+                "message": f"Deleted {deleted_count} of {total} email(s). {len(not_found_ids)} not found (likely already deleted)"
+            }
+        else:
+            return {
+                "success": False,
+                "message": f"No emails deleted. All {total} message(s) not found in Mail.app (likely already deleted)"
+            }
+
     def list_accounts(self) -> List[str]:
         """
         List available email accounts.
-        
+
         Returns:
             List of account names
         """
         if not applescript.check_app_access(self.app_name):
             logger.error("Cannot access Mail app")
             return []
-        
+
         script = '''
         tell application "Mail"
             try
@@ -636,7 +814,7 @@ class MailHandler:
             end try
         end tell
         '''
-        
+
         result = applescript.run_script(script)
         if result['success'] and result['result'] and not result['result'].startswith("Error"):
             return result['result'].split("|||") if result['result'] else []
